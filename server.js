@@ -10,6 +10,7 @@ const PIN = (process.env.APP_PIN || "").trim();
 // Fem faste personer. Rekkefølgen her er den som lagres i databasen (0–4).
 const DEFAULT_NAMES = ["Lisell", "Annika", "Lina", "Johanna", "Elin"];
 const N = DEFAULT_NAMES.length;
+const ALL = DEFAULT_NAMES.map((_, i) => i);
 
 if (!process.env.DATABASE_URL) {
   console.error("DATABASE_URL mangler. Sett den som miljøvariabel.");
@@ -65,6 +66,8 @@ async function initDb() {
       created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+  // Hvem som deler hvert utlegg. Eldre utlegg uten valg deles på alle fem.
+  await pool.query(`ALTER TABLE g5_expenses ADD COLUMN IF NOT EXISTS shares JSONB NOT NULL DEFAULT '${JSON.stringify(ALL)}'`);
   await pool.query(`CREATE INDEX IF NOT EXISTS g5_expenses_period_idx ON g5_expenses (period_id);`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS g5_config (
@@ -119,18 +122,33 @@ function cleanNames(list, current) {
 function namesOf(v) {
   return Array.isArray(v) && v.length === N ? v : DEFAULT_NAMES.slice();
 }
+function cleanShares(v) {
+  if (!Array.isArray(v)) return ALL.slice();
+  const set = new Set();
+  v.forEach(x => {
+    const i = parseInt(x, 10);
+    if (Number.isInteger(i) && i >= 0 && i < N) set.add(i);
+  });
+  return set.size ? Array.from(set).sort((a, b) => a - b) : ALL.slice();
+}
 function cleanPayer(v) {
   const p = parseInt(v, 10);
   return Number.isInteger(p) && p >= 0 && p < N ? p : 0;
 }
 
-/* Fordeler alt likt på fem, og finner færrest mulig betalinger
-   som gjør alle kvitt. Alt regnes i øre for å unngå avrundingsfeil. */
-function settlement(totalsKr) {
-  const paid = totalsKr.map(v => Math.round(v * 100));
-  const sum = paid.reduce((a, b) => a + b, 0);
-  // Saldo i femtedels øre: positiv = har til gode, negativ = skylder.
-  const bal = paid.map(p => p * N - sum);
+/* Hvert utlegg deles likt på dem som er huket av som deltakere.
+   Oppgjøret finner færrest mulig betalinger som gjør alle kvitt.
+   Alt regnes i 1/60 øre (60 er delelig med 1–5), så delingen blir eksakt. */
+const UNIT = 60;
+function settlement(expenses) {
+  const bal = new Array(N).fill(0);
+  expenses.forEach(e => {
+    const ore = Math.round(num(e.amount) * 100);
+    const sh = cleanShares(e.shares);
+    bal[cleanPayer(e.payer)] += ore * UNIT;
+    const part = (ore * UNIT) / sh.length;
+    sh.forEach(i => { bal[i] -= part; });
+  });
   const cred = [], debt = [];
   bal.forEach((b, i) => {
     if (b > 0) cred.push({ i, v: b });
@@ -142,7 +160,7 @@ function settlement(totalsKr) {
   let ci = 0, di = 0;
   while (ci < cred.length && di < debt.length) {
     const m = Math.min(cred[ci].v, debt[di].v);
-    const ore = Math.round(m / N);
+    const ore = Math.round(m / UNIT);
     if (ore >= 1) out.push({ from: debt[di].i, to: cred[ci].i, amount: ore / 100 });
     cred[ci].v -= m;
     debt[di].v -= m;
@@ -158,7 +176,7 @@ async function readState() {
     "SELECT id, started_at, settled_at, totals, transfers, names FROM g5_periods ORDER BY id DESC LIMIT 60"
   )).rows;
   const expenses = (await pool.query(
-    "SELECT id, to_char(date, 'YYYY-MM-DD') AS date, descr, amount, payer FROM g5_expenses WHERE period_id = $1 ORDER BY date DESC, id DESC",
+    "SELECT id, to_char(date, 'YYYY-MM-DD') AS date, descr, amount, payer, shares FROM g5_expenses WHERE period_id = $1 ORDER BY date DESC, id DESC",
     [cfg.current_period_id]
   )).rows;
 
@@ -180,7 +198,8 @@ async function readState() {
       date: e.date,
       desc: e.descr,
       amount: num(e.amount),
-      payer: e.payer
+      payer: e.payer,
+      shares: cleanShares(e.shares)
     }))
   };
 }
@@ -196,6 +215,7 @@ function readExpenseBody(body) {
   return {
     amount: Math.round(amount * 100) / 100,
     payer: cleanPayer(body.payer),
+    shares: JSON.stringify(cleanShares(body.shares)),
     date: /^\d{4}-\d{2}-\d{2}$/.test(body.date || "")
       ? body.date
       : new Date().toISOString().slice(0, 10),
@@ -217,8 +237,8 @@ app.post("/api/expenses", async (req, res) => {
 
     const cfg = (await pool.query("SELECT current_period_id FROM g5_config WHERE id = 1")).rows[0];
     await pool.query(
-      "INSERT INTO g5_expenses (period_id, date, descr, amount, payer) VALUES ($1, $2, $3, $4, $5)",
-      [cfg.current_period_id, x.date, x.descr, x.amount, x.payer]
+      "INSERT INTO g5_expenses (period_id, date, descr, amount, payer, shares) VALUES ($1, $2, $3, $4, $5, $6)",
+      [cfg.current_period_id, x.date, x.descr, x.amount, x.payer, x.shares]
     );
     res.json(await readState());
   } catch (e) { fail(res, e); }
@@ -233,8 +253,8 @@ app.put("/api/expenses/:id", async (req, res) => {
     if (!x) return res.status(400).json({ error: "ugyldig_belop" });
 
     await pool.query(
-      "UPDATE g5_expenses SET date = $1, descr = $2, amount = $3, payer = $4 WHERE id = $5",
-      [x.date, x.descr, x.amount, x.payer, id]
+      "UPDATE g5_expenses SET date = $1, descr = $2, amount = $3, payer = $4, shares = $5 WHERE id = $6",
+      [x.date, x.descr, x.amount, x.payer, x.shares, id]
     );
     res.json(await readState());
   } catch (e) { fail(res, e); }
@@ -245,12 +265,13 @@ app.get("/api/periods/:id/expenses", async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id)) return res.status(400).json({ error: "ugyldig_id" });
     const rows = (await pool.query(
-      "SELECT id, to_char(date, 'YYYY-MM-DD') AS date, descr, amount, payer FROM g5_expenses WHERE period_id = $1 ORDER BY date DESC, id DESC",
+      "SELECT id, to_char(date, 'YYYY-MM-DD') AS date, descr, amount, payer, shares FROM g5_expenses WHERE period_id = $1 ORDER BY date DESC, id DESC",
       [id]
     )).rows;
     res.json({
       expenses: rows.map(e => ({
-        id: e.id, date: e.date, desc: e.descr, amount: num(e.amount), payer: e.payer
+        id: e.id, date: e.date, desc: e.descr, amount: num(e.amount), payer: e.payer,
+        shares: cleanShares(e.shares)
       }))
     });
   } catch (e) { fail(res, e); }
@@ -283,12 +304,13 @@ app.post("/api/settle", async (req, res) => {
     const names = namesOf(cfg.names);
 
     const rows = (await client.query(
-      "SELECT payer, COALESCE(SUM(amount), 0) AS s FROM g5_expenses WHERE period_id = $1 GROUP BY payer",
+      "SELECT amount, payer, shares FROM g5_expenses WHERE period_id = $1",
       [pid]
     )).rows;
     const totals = new Array(N).fill(0);
-    rows.forEach(r => { totals[r.payer] = num(r.s); });
-    const transfers = settlement(totals);
+    rows.forEach(r => { totals[cleanPayer(r.payer)] += num(r.amount); });
+    for (let i = 0; i < N; i++) totals[i] = Math.round(totals[i] * 100) / 100;
+    const transfers = settlement(rows);
 
     await client.query(
       `UPDATE g5_periods SET settled_at = now(), totals = $1, transfers = $2, names = $3
