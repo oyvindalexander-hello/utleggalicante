@@ -101,6 +101,13 @@ input.big{font-family:'Fraunces',Georgia,serif;font-size:1.3rem;font-variant-num
   font-size:.92rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
 }
 .payer button[aria-pressed=true]{background:var(--pw);border-color:var(--pc);color:var(--pc);font-weight:600}
+.shares button{position:relative;padding-left:22px}
+.shares button::before{content:"";position:absolute;left:9px;top:50%;width:8px;height:8px;margin-top:-4px;
+  border-radius:3px;border:1.5px solid var(--line)}
+.shares button[aria-pressed=true]::before{background:var(--pc);border-color:var(--pc)}
+.lbl{display:flex;justify-content:space-between;align-items:baseline;gap:10px}
+.lbl .linkbtn{font-size:.78rem;padding:0}
+.each{font-size:.78rem;color:var(--soft);margin-top:6px;min-height:1.2em}
 .primary{width:100%;margin-top:4px;background:var(--ink);color:var(--paper);border:0;border-radius:9px;padding:13px;font-weight:600}
 .primary:disabled{opacity:.4;cursor:not-allowed}
 .hint{font-size:.82rem;color:var(--warn);margin-top:8px}
@@ -248,6 +255,13 @@ ul.hist .line .v{font-variant-numeric:tabular-nums;white-space:nowrap}
         <div class="payer" id="payers"></div>
       </div>
     </div>
+    <div class="form-row">
+      <div class="f" style="display:flex;flex-direction:column;gap:5px;flex:1;min-width:0">
+        <span class="lbl"><span class="l" style="font-size:.8rem;color:var(--soft)">Hvem er med?</span><button type="button" class="linkbtn" id="sharesAll">Alle</button></span>
+        <div class="payer shares" id="sharers"></div>
+        <div class="each" id="each"></div>
+      </div>
+    </div>
     <button class="primary" id="add">Legg til utlegg</button>
     <div class="hint" id="hint"></div>
   </div>
@@ -286,7 +300,8 @@ ul.hist .line .v{font-variant-numeric:tabular-nums;white-space:nowrap}
   var N = DEFAULT_NAMES.length;
 
   var cfg = { names: DEFAULT_NAMES.slice(), currentPeriodId:null };
-  var expenses = [], periods = [], payer = 0, pin = "";
+  var ALL = DEFAULT_NAMES.map(function(_, i){ return i; });
+  var expenses = [], periods = [], payer = 0, shares = ALL.slice(), pin = "";
   var editingId = null, openPeriod = null, archive = {}, confirmReopen = null;
   var $ = function(id){ return document.getElementById(id); };
   function el(tag, cls, text){
@@ -330,6 +345,37 @@ ul.hist .line .v{font-variant-numeric:tabular-nums;white-space:nowrap}
   }
   function nm(i, names){ var n = names || cfg.names; return (n && n[i]) || DEFAULT_NAMES[i] || "?"; }
   function pidx(v){ v = parseInt(v,10); return (v >= 0 && v < N) ? v : 0; }
+  function sh(e){
+    var s = Array.isArray(e.shares) ? e.shares.filter(function(i){ return i >= 0 && i < N; }) : [];
+    return s.length ? s : ALL.slice();
+  }
+  function forText(e, names){
+    var s = sh(e);
+    if(s.length === N) return "";
+    return " · for " + s.map(function(i){ return nm(i, names); }).join(", ");
+  }
+  function toggleIn(list, i){
+    var k = list.indexOf(i);
+    if(k > -1){ if(list.length > 1) list.splice(k, 1); }
+    else { list.push(i); list.sort(); }
+  }
+  /* Rad med av/på-knapper for hvem som er med på et utlegg. */
+  function shareButtons(box, list, onChange){
+    box.textContent = "";
+    for(var i=0;i<N;i++){
+      (function(i){
+        var b = el("button", "c" + i, nm(i));
+        b.type = "button";
+        b.setAttribute("aria-pressed", list.indexOf(i) > -1 ? "true" : "false");
+        b.addEventListener("click", function(){
+          toggleIn(list, i);
+          shareButtons(box, list, onChange);
+          if(onChange) onChange();
+        });
+        box.appendChild(b);
+      })(i);
+    }
+  }
 
   /* ---------- API ---------- */
   function api(method, url, body){
@@ -416,20 +462,29 @@ ul.hist .line .v{font-variant-numeric:tabular-nums;white-space:nowrap}
   }
 
   /* ---------- utregning ----------
-     Alle utlegg deles likt på fem. Oppgjøret finner færrest mulig
-     betalinger som gjør alle kvitt (samme regel som på serveren). */
+     Hvert utlegg deles likt på dem som er huket av. Oppgjøret finner
+     færrest mulig betalinger som gjør alle kvitt (samme regel som på serveren).
+     Alt regnes i 1/60 øre slik at deling på 1–5 blir eksakt. */
+  var UNIT = 60;
   function totals(){
     var t = [];
     for(var i=0;i<N;i++) t.push(0);
     for(var j=0;j<expenses.length;j++) t[pidx(expenses[j].payer)] += expenses[j].amount;
     return t;
   }
-  function settlement(t){
-    var paid = t.map(function(v){ return Math.round(v*100); });
-    var sum = paid.reduce(function(a,b){ return a+b; }, 0);
-    var cred = [], debt = [];
-    paid.forEach(function(p, i){
-      var b = p*N - sum;
+  function balances(list){
+    var bal = [];
+    for(var i=0;i<N;i++) bal.push(0);
+    list.forEach(function(e){
+      var ore = Math.round(e.amount*100), s = sh(e), part = ore*UNIT/s.length;
+      bal[pidx(e.payer)] += ore*UNIT;
+      s.forEach(function(i){ bal[i] -= part; });
+    });
+    return bal;
+  }
+  function settlement(list){
+    var bal = balances(list), cred = [], debt = [];
+    bal.forEach(function(b, i){
       if(b > 0) cred.push({i:i, v:b}); else if(b < 0) debt.push({i:i, v:-b});
     });
     cred.sort(function(x,y){ return y.v - x.v; });
@@ -437,7 +492,7 @@ ul.hist .line .v{font-variant-numeric:tabular-nums;white-space:nowrap}
     var out = [], ci = 0, di = 0;
     while(ci < cred.length && di < debt.length){
       var m = Math.min(cred[ci].v, debt[di].v);
-      var ore = Math.round(m / N);
+      var ore = Math.round(m / UNIT);
       if(ore >= 1) out.push({from: debt[di].i, to: cred[ci].i, amount: ore/100});
       cred[ci].v -= m; debt[di].v -= m;
       if(cred[ci].v === 0) ci++;
@@ -489,11 +544,20 @@ ul.hist .line .v{font-variant-numeric:tabular-nums;white-space:nowrap}
       var inp = $("name" + k);
       if(inp && document.activeElement !== inp) inp.value = nm(k);
     }
+    shareButtons($("sharers"), shares, renderEach);
+    renderEach();
+  }
+  function renderEach(){
+    var amount = parseAmount($("fAmount").value);
+    var who = shares.length === N ? "alle fem" : shares.length === 1 ? "én person" : shares.length + " personer";
+    $("each").textContent = isFinite(amount) && amount > 0
+      ? "Deles på " + who + ": " + kr(amount / shares.length) + " hver"
+      : "Deles på " + who;
   }
   function renderHero(){
     var t = totals(), sum = t.reduce(function(a,b){ return a+b; }, 0);
-    var share = sum / N;
-    var tr = settlement(t);
+    var bal = balances(expenses);
+    var tr = settlement(expenses);
 
     var split = $("split");
     split.textContent = "";
@@ -517,15 +581,13 @@ ul.hist .line .v{font-variant-numeric:tabular-nums;white-space:nowrap}
         who.addEventListener("click", function(){ openNames(j); });
         lg.appendChild(who);
         lg.appendChild(el("span", "amt", kr(t[j])));
-        var d = Math.round((t[j] - share)*100)/100;
+        var d = Math.round(bal[j] / UNIT) / 100;
         var cls = Math.abs(d) < 0.005 ? "zero" : (d > 0 ? "plus" : "minus");
         lg.appendChild(el("span", "bal " + cls,
           Math.abs(d) < 0.005 ? "±0" : (d > 0 ? "+" : "−") + kr(Math.abs(d))));
       })(j);
     }
-    $("totLine").textContent = sum > 0
-      ? "Totalt " + kr(sum) + " · " + kr(share) + " per person"
-      : "";
+    $("totLine").textContent = sum > 0 ? "Totalt " + kr(sum) + " lagt ut i perioden" : "";
 
     var v = $("verdict"), pl = $("payList");
     pl.textContent = "";
@@ -598,6 +660,16 @@ ul.hist .line .v{font-variant-numeric:tabular-nums;white-space:nowrap}
     r3.appendChild(pl);
     li.appendChild(r3);
 
+    var eShares = sh(e).slice();
+    var r4 = el("div", "row2");
+    var sl = el("label");
+    sl.appendChild(el("span", "l", "Hvem er med?"));
+    var sw = el("span", "payer shares");
+    shareButtons(sw, eShares);
+    sl.appendChild(sw);
+    r4.appendChild(sl);
+    li.appendChild(r4);
+
     var acts = el("div", "editacts");
 
     var cancel = el("button", null, "Avbryt");
@@ -623,7 +695,8 @@ ul.hist .line .v{font-variant-numeric:tabular-nums;white-space:nowrap}
         amount: Math.round(amount*100)/100,
         date: document.getElementById("eDate").value || e.date,
         desc: (document.getElementById("eDesc").value || "").trim(),
-        payer: chosen
+        payer: chosen,
+        shares: eShares
       }).then(function(state){
         editingId = null;
         apply(state);
@@ -658,7 +731,7 @@ ul.hist .line .v{font-variant-numeric:tabular-nums;white-space:nowrap}
 
       var d = el("span", "desc");
       d.appendChild(el("b", null, e.desc || "Utlegg"));
-      d.appendChild(el("small", null, shortDate(e.date) + " · " + nm(pidx(e.payer))));
+      d.appendChild(el("small", null, shortDate(e.date) + " · " + nm(pidx(e.payer)) + " la ut" + forText(e)));
       tap.appendChild(d);
 
       tap.appendChild(el("span", "amt2", kr(e.amount)));
@@ -744,7 +817,7 @@ ul.hist .line .v{font-variant-numeric:tabular-nums;white-space:nowrap}
             var line = el("div", "line c" + pidx(e.payer));
             line.appendChild(el("span", "dot"));
             line.appendChild(el("span", "dd", shortDate(e.date)));
-            line.appendChild(el("span", "d", (e.desc || "Utlegg") + " · " + nm(pidx(e.payer), names)));
+            line.appendChild(el("span", "d", (e.desc || "Utlegg") + " · " + nm(pidx(e.payer), names) + forText(e, names)));
             line.appendChild(el("span", "v", kr(e.amount)));
             body.appendChild(line);
           });
@@ -809,12 +882,14 @@ ul.hist .line .v{font-variant-numeric:tabular-nums;white-space:nowrap}
       amount: Math.round(amount*100)/100,
       date: $("fDate").value || today(),
       desc: ($("fDesc").value || "").trim(),
-      payer: payer
+      payer: payer,
+      shares: shares.slice()
     };
     say("");
     $("add").disabled = true;
     api("POST", "/api/expenses", body).then(function(state){
       $("fAmount").value = ""; $("fDesc").value = "";
+      shares = ALL.slice();
       apply(state);
       $("fAmount").focus();
     }).catch(function(){ say("Klarte ikke å lagre. Prøv igjen."); })
@@ -861,6 +936,12 @@ ul.hist .line .v{font-variant-numeric:tabular-nums;white-space:nowrap}
   nameInputs($("settleNames"), "sName");
 
   $("add").addEventListener("click", addExpense);
+  $("fAmount").addEventListener("input", renderEach);
+  $("sharesAll").addEventListener("click", function(){
+    shares = ALL.slice();
+    shareButtons($("sharers"), shares, renderEach);
+    renderEach();
+  });
   $("fAmount").addEventListener("keydown", function(e){ if(e.key === "Enter") $("fDesc").focus(); });
   $("fDesc").addEventListener("keydown", function(e){ if(e.key === "Enter") addExpense(); });
 
@@ -881,7 +962,7 @@ ul.hist .line .v{font-variant-numeric:tabular-nums;white-space:nowrap}
   $("settleBtn").addEventListener("click", function(){
     if(expenses.length === 0){ say("Ingen utlegg å gjøre opp."); return; }
     say("");
-    var tr = settlement(totals());
+    var tr = settlement(expenses);
     var sl = $("settleList");
     sl.textContent = "";
     if(tr.length === 0){
