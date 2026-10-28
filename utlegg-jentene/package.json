@@ -1,0 +1,17 @@
+{
+  "name": "utleggsoversikt-jentene",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Utleggsoversikt - delt utleggsoversikt for fem personer",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "pg": "^8.12.0"
+  }
+}
